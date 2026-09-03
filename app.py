@@ -1,8 +1,10 @@
 """
 Screener financiero para research de M&A.
 Frontend Streamlit: busca un ticker o nombre de empresa y muestra estados
-financieros, ratios y múltiplos obtenidos en vivo de yfinance.
+financieros, ratios, gráfico de precio y noticias, obtenidos en vivo de yfinance.
 """
+
+import io
 
 import pandas as pd
 import streamlit as st
@@ -12,29 +14,33 @@ from data_fetcher import (
     DataFetchError,
     TickerNotFoundError,
     fetch_company_data,
+    fetch_company_news,
+    fetch_price_history,
     resolve_ticker,
 )
 
 st.set_page_config(page_title="M&A Screener", page_icon="📊", layout="wide")
 
+PRICE_PERIODS = {
+    "1 mes": "1mo",
+    "6 meses": "6mo",
+    "1 año": "1y",
+    "5 años": "5y",
+    "Máximo": "max",
+}
+
 
 def format_big_number(value):
+    """Formatea un número grande con separador de miles, sin abreviar."""
     if value is None or value == "":
         return "N/D"
     try:
         value = float(value)
     except (TypeError, ValueError):
         return str(value)
-    abs_v = abs(value)
-    if abs_v >= 1e12:
-        return f"{value / 1e12:.2f}T"
-    if abs_v >= 1e9:
-        return f"{value / 1e9:.2f}B"
-    if abs_v >= 1e6:
-        return f"{value / 1e6:.2f}M"
-    if abs_v >= 1e3:
-        return f"{value / 1e3:.2f}K"
-    return f"{value:.2f}"
+    if value == int(value):
+        return f"{int(value):,}"
+    return f"{value:,.2f}"
 
 
 def format_ratio_value(key: str, value):
@@ -54,21 +60,54 @@ def format_ratio_value(key: str, value):
         if any(b in key_lower for b in big_keys) and "growth" not in key_lower:
             return format_big_number(value)
         if isinstance(value, float):
-            return f"{value:.2f}"
+            return f"{value:,.2f}"
         return f"{value:,}" if isinstance(value, int) else str(value)
     except (TypeError, ValueError):
         return str(value)
 
 
-def render_financial_table(df: pd.DataFrame, label: str):
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Datos") -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name[:31])
+    return buffer.getvalue()
+
+
+def format_financial_df(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Prepara la tabla para mostrar: cabeceras simplificadas y números con separador de miles."""
+    display_df = df.copy()
+    if period == "Anual":
+        # Solo el año, sin la fecha completa (día/mes son irrelevantes para el usuario).
+        display_df.columns = [
+            c.strftime("%Y") if hasattr(c, "strftime") else str(c) for c in display_df.columns
+        ]
+    else:
+        display_df.columns = [
+            c.strftime("%Y-%m-%d") if hasattr(c, "strftime") else str(c) for c in display_df.columns
+        ]
+    formatted = display_df.map(
+        lambda v: format_big_number(v) if pd.notna(v) else "-"
+    )
+    return formatted
+
+
+def render_financial_table(df: pd.DataFrame, label: str, period: str, currency: str, key_prefix: str):
     if df is None or df.empty:
         st.info(f"No hay datos de {label.lower()} disponibles para este ticker.")
         return
-    display_df = df.copy()
-    display_df.columns = [
-        c.strftime("%Y-%m-%d") if hasattr(c, "strftime") else str(c) for c in display_df.columns
-    ]
-    st.dataframe(display_df, use_container_width=True)
+
+    st.caption(f"Cifras en {currency}" if currency else "Divisa no disponible")
+    formatted = format_financial_df(df, period)
+    st.dataframe(formatted, use_container_width=True)
+
+    excel_bytes = df_to_excel_bytes(df, sheet_name=label)
+    st.download_button(
+        label=f"⬇️ Descargar {label} (Excel)",
+        data=excel_bytes,
+        file_name=f"{key_prefix}_{label.lower().replace(' ', '_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"download_{key_prefix}_{label}_{period}",
+    )
 
 
 def render_ratios(data: CompanyData):
@@ -77,10 +116,70 @@ def render_ratios(data: CompanyData):
     if debt_ebitda is not None:
         ratios["Debt/EBITDA (calculado)"] = debt_ebitda
 
+    st.caption(f"Cifras monetarias en {data.currency}" if data.currency else "Divisa no disponible")
+
     cols = st.columns(4)
     for idx, (key, value) in enumerate(ratios.items()):
         with cols[idx % 4]:
             st.metric(key, format_ratio_value(key, value))
+
+    ratios_df = pd.DataFrame(
+        [{"Ratio": k, "Valor": v} for k, v in ratios.items()]
+    ).set_index("Ratio")
+    excel_bytes = df_to_excel_bytes(ratios_df, sheet_name="Ratios")
+    st.download_button(
+        label="⬇️ Descargar Ratios y múltiplos (Excel)",
+        data=excel_bytes,
+        file_name=f"{data.ticker}_ratios.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_ratios",
+    )
+
+
+def render_price_chart(data: CompanyData):
+    period_label = st.select_slider(
+        "Rango del gráfico", options=list(PRICE_PERIODS.keys()), value="1 año"
+    )
+    try:
+        hist = fetch_price_history(data.ticker, PRICE_PERIODS[period_label])
+    except DataFetchError as e:
+        st.error(str(e))
+        return
+
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        st.info("No hay histórico de precio disponible para este ticker.")
+        return
+
+    st.caption(f"Precio de cierre en {data.currency}" if data.currency else "Divisa no disponible")
+    st.line_chart(hist["Close"], use_container_width=True)
+
+
+def render_news(data: CompanyData):
+    try:
+        news_items = fetch_company_news(data.ticker)
+    except DataFetchError as e:
+        st.error(str(e))
+        return
+
+    if not news_items:
+        st.info("No se han encontrado noticias recientes para esta empresa.")
+        return
+
+    for item in news_items:
+        title = item.get("title") or "(sin título)"
+        link = item.get("link")
+        publisher = item.get("publisher") or "Fuente desconocida"
+        pub_date = item.get("pub_date") or ""
+        summary = item.get("summary") or ""
+
+        if link:
+            st.markdown(f"**[{title}]({link})**")
+        else:
+            st.markdown(f"**{title}**")
+        st.caption(f"{publisher} · {pub_date}")
+        if summary:
+            st.write(summary)
+        st.divider()
 
 
 def render_header(data: CompanyData):
@@ -96,36 +195,48 @@ def render_header(data: CompanyData):
     st.caption(f"Última actualización (fetch cacheado): {data.fetched_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
-def main():
-    st.sidebar.header("Buscador")
-    query = st.sidebar.text_input(
-        "Ticker o nombre de empresa",
-        placeholder="Ej: AAPL, Microsoft, Inditex...",
-    )
-    search_clicked = st.sidebar.button("Buscar", type="primary")
+def resolve_and_set_ticker(query: str):
+    with st.spinner("Resolviendo ticker..."):
+        try:
+            resolved = resolve_ticker(query)
+        except DataFetchError as e:
+            st.session_state.search_error = str(e)
+            return
+    if resolved:
+        st.session_state.current_ticker = resolved
+        st.session_state.search_error = None
+    else:
+        st.session_state.search_error = f"No se pudo resolver '{query}' a un ticker válido."
 
+
+def main():
     if "current_ticker" not in st.session_state:
         st.session_state.current_ticker = None
+    if "last_query" not in st.session_state:
+        st.session_state.last_query = ""
+    if "search_error" not in st.session_state:
+        st.session_state.search_error = None
 
-    if search_clicked and query:
-        with st.spinner("Resolviendo ticker..."):
-            try:
-                resolved = resolve_ticker(query)
-            except DataFetchError as e:
-                st.sidebar.error(str(e))
-                resolved = None
-        if resolved:
-            st.session_state.current_ticker = resolved
-        else:
-            st.sidebar.error(f"No se pudo resolver '{query}' a un ticker válido.")
+    st.markdown("### 📊 M&A Screener")
+    query = st.text_input(
+        "Buscador",
+        placeholder="Ticker o nombre de empresa (ej: AAPL, Microsoft, Inditex...) — pulsa Enter",
+        label_visibility="collapsed",
+    )
+
+    if query and query != st.session_state.last_query:
+        st.session_state.last_query = query
+        resolve_and_set_ticker(query)
+
+    if st.session_state.search_error:
+        st.error(st.session_state.search_error)
 
     ticker = st.session_state.current_ticker
 
     if not ticker:
-        st.title("📊 M&A Screener")
         st.write(
             "Busca una empresa por ticker (ej. `AAPL`) o por nombre (ej. `Microsoft`) "
-            "en la barra lateral para ver sus estados financieros y ratios."
+            "y pulsa Enter para ver sus estados financieros, ratios, gráfico y noticias."
         )
         return
 
@@ -145,18 +256,24 @@ def main():
 
     with st.expander("💰 Cuenta de resultados", expanded=True):
         df = data.income_annual if period == "Anual" else data.income_quarterly
-        render_financial_table(df, "cuenta de resultados")
+        render_financial_table(df, "Cuenta de resultados", period, data.currency, data.ticker)
 
     with st.expander("🏦 Balance"):
         df = data.balance_annual if period == "Anual" else data.balance_quarterly
-        render_financial_table(df, "balance")
+        render_financial_table(df, "Balance", period, data.currency, data.ticker)
 
     with st.expander("💵 Cash Flow"):
         df = data.cashflow_annual if period == "Anual" else data.cashflow_quarterly
-        render_financial_table(df, "cash flow")
+        render_financial_table(df, "Cash Flow", period, data.currency, data.ticker)
 
     with st.expander("📈 Ratios y múltiplos", expanded=True):
         render_ratios(data)
+
+    with st.expander("📉 Evolución del precio", expanded=True):
+        render_price_chart(data)
+
+    with st.expander("📰 Noticias recientes"):
+        render_news(data)
 
 
 if __name__ == "__main__":

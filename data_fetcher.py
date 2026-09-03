@@ -166,6 +166,41 @@ def fetch_company_data(ticker: str) -> CompanyData:
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_price_history(ticker: str, period: str = "1y") -> pd.DataFrame:
+    """Descarga el histórico de precio de cierre para el gráfico de evolución."""
+    try:
+        hist = yf.Ticker(ticker).history(period=period)
+    except Exception as e:
+        raise DataFetchError(f"Error al descargar histórico de precio de '{ticker}': {e}") from e
+    return _safe_df(hist)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_company_news(ticker: str, max_items: int = 10) -> list[dict]:
+    """Descarga noticias recientes sobre la empresa desde Yahoo Finance."""
+    try:
+        raw_news = yf.Ticker(ticker).news or []
+    except Exception as e:
+        raise DataFetchError(f"Error al descargar noticias de '{ticker}': {e}") from e
+
+    items = []
+    for entry in raw_news[:max_items]:
+        content = entry.get("content", entry)  # compat con formatos antiguos de yfinance
+        provider = content.get("provider") or {}
+        link = (content.get("clickThroughUrl") or content.get("canonicalUrl") or {}).get("url")
+        items.append(
+            {
+                "title": content.get("title"),
+                "summary": content.get("summary"),
+                "publisher": provider.get("displayName"),
+                "link": link,
+                "pub_date": content.get("pubDate"),
+            }
+        )
+    return items
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def resolve_ticker(query: str) -> Optional[str]:
     """
     Resuelve un nombre de empresa (o ticker ya válido) a un ticker de yfinance

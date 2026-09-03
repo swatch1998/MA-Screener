@@ -1,7 +1,7 @@
 """
 Screener financiero para research de M&A.
-Frontend Streamlit: busca un ticker o nombre de empresa y muestra estados
-financieros, ratios, gráfico de precio y noticias, obtenidos en vivo de yfinance.
+Frontend Streamlit: busca un ticker o nombre de empresa y muestra gráfico de
+precio, noticias, estados financieros y ratios, obtenidos en vivo de yfinance.
 """
 
 import io
@@ -21,12 +21,15 @@ from data_fetcher import (
 
 st.set_page_config(page_title="M&A Screener", page_icon="📊", layout="wide")
 
-PRICE_PERIODS = {
-    "1 mes": "1mo",
-    "6 meses": "6mo",
-    "1 año": "1y",
-    "5 años": "5y",
-    "Máximo": "max",
+# Cada opción: (período de yfinance, intervalo de vela)
+PRICE_RANGES = {
+    "1D": ("1d", "5m"),
+    "5D": ("5d", "15m"),
+    "1M": ("1mo", "1d"),
+    "6M": ("6mo", "1d"),
+    "1A": ("1y", "1d"),
+    "5A": ("5y", "1wk"),
+    "Máx": ("max", "1mo"),
 }
 
 
@@ -73,27 +76,44 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Datos") -> bytes:
     return buffer.getvalue()
 
 
+def period_label(col, period: str) -> str:
+    """Etiqueta de columna: solo el año en Anual, fecha completa en Trimestral."""
+    if hasattr(col, "strftime"):
+        return col.strftime("%Y") if period == "Anual" else col.strftime("%Y-%m-%d")
+    return str(col)
+
+
+def collect_period_labels(dfs, period: str) -> list[str]:
+    """Etiquetas únicas de periodo disponibles, en el orden en que aparecen (más reciente primero)."""
+    labels: list[str] = []
+    for df in dfs:
+        if df is None or df.empty:
+            continue
+        for c in df.columns:
+            lbl = period_label(c, period)
+            if lbl not in labels:
+                labels.append(lbl)
+    return labels
+
+
+def filter_columns_by_labels(df: pd.DataFrame, period: str, selected_labels: list[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    mask = [period_label(c, period) in selected_labels for c in df.columns]
+    return df.loc[:, mask]
+
+
 def format_financial_df(df: pd.DataFrame, period: str) -> pd.DataFrame:
     """Prepara la tabla para mostrar: cabeceras simplificadas y números con separador de miles."""
     display_df = df.copy()
-    if period == "Anual":
-        # Solo el año, sin la fecha completa (día/mes son irrelevantes para el usuario).
-        display_df.columns = [
-            c.strftime("%Y") if hasattr(c, "strftime") else str(c) for c in display_df.columns
-        ]
-    else:
-        display_df.columns = [
-            c.strftime("%Y-%m-%d") if hasattr(c, "strftime") else str(c) for c in display_df.columns
-        ]
-    formatted = display_df.map(
-        lambda v: format_big_number(v) if pd.notna(v) else "-"
-    )
+    display_df.columns = [period_label(c, period) for c in display_df.columns]
+    formatted = display_df.map(lambda v: format_big_number(v) if pd.notna(v) else "-")
     return formatted
 
 
 def render_financial_table(df: pd.DataFrame, label: str, period: str, currency: str, key_prefix: str):
     if df is None or df.empty:
-        st.info(f"No hay datos de {label.lower()} disponibles para este ticker.")
+        st.info(f"No hay datos de {label.lower()} disponibles para el periodo seleccionado.")
         return
 
     st.caption(f"Cifras en {currency}" if currency else "Divisa no disponible")
@@ -137,11 +157,14 @@ def render_ratios(data: CompanyData):
 
 
 def render_price_chart(data: CompanyData):
-    period_label = st.select_slider(
-        "Rango del gráfico", options=list(PRICE_PERIODS.keys()), value="1 año"
+    range_label = st.segmented_control(
+        "Rango del gráfico", options=list(PRICE_RANGES.keys()), default="1A", key="price_range"
     )
+    range_label = range_label or "1A"
+    yf_period, yf_interval = PRICE_RANGES[range_label]
+
     try:
-        hist = fetch_price_history(data.ticker, PRICE_PERIODS[period_label])
+        hist = fetch_price_history(data.ticker, yf_period, yf_interval)
     except DataFetchError as e:
         st.error(str(e))
         return
@@ -236,7 +259,7 @@ def main():
     if not ticker:
         st.write(
             "Busca una empresa por ticker (ej. `AAPL`) o por nombre (ej. `Microsoft`) "
-            "y pulsa Enter para ver sus estados financieros, ratios, gráfico y noticias."
+            "y pulsa Enter para ver su gráfico, noticias, estados financieros y ratios."
         )
         return
 
@@ -252,28 +275,47 @@ def main():
 
     render_header(data)
 
-    period = st.radio("Periodo", ["Anual", "Trimestral"], horizontal=True)
-
-    with st.expander("💰 Cuenta de resultados", expanded=True):
-        df = data.income_annual if period == "Anual" else data.income_quarterly
-        render_financial_table(df, "Cuenta de resultados", period, data.currency, data.ticker)
-
-    with st.expander("🏦 Balance"):
-        df = data.balance_annual if period == "Anual" else data.balance_quarterly
-        render_financial_table(df, "Balance", period, data.currency, data.ticker)
-
-    with st.expander("💵 Cash Flow"):
-        df = data.cashflow_annual if period == "Anual" else data.cashflow_quarterly
-        render_financial_table(df, "Cash Flow", period, data.currency, data.ticker)
-
-    with st.expander("📈 Ratios y múltiplos", expanded=True):
-        render_ratios(data)
-
     with st.expander("📉 Evolución del precio", expanded=True):
         render_price_chart(data)
 
-    with st.expander("📰 Noticias recientes"):
+    with st.expander("📰 Noticias recientes", expanded=True):
         render_news(data)
+
+    period = st.radio("Periodicidad de los estados financieros", ["Anual", "Trimestral"], horizontal=True)
+    st.caption(
+        "Nota: yfinance solo distingue periodicidad Anual y Trimestral — las empresas no publican "
+        "cuentas mensuales, así que esa granularidad no existe como dato real."
+    )
+
+    income_df = data.income_annual if period == "Anual" else data.income_quarterly
+    balance_df = data.balance_annual if period == "Anual" else data.balance_quarterly
+    cashflow_df = data.cashflow_annual if period == "Anual" else data.cashflow_quarterly
+
+    available_labels = collect_period_labels([income_df, balance_df, cashflow_df], period)
+    if available_labels:
+        selected_labels = st.multiselect(
+            "Periodos a mostrar y descargar",
+            options=available_labels,
+            default=available_labels,
+        )
+    else:
+        selected_labels = []
+
+    income_df = filter_columns_by_labels(income_df, period, selected_labels)
+    balance_df = filter_columns_by_labels(balance_df, period, selected_labels)
+    cashflow_df = filter_columns_by_labels(cashflow_df, period, selected_labels)
+
+    with st.expander("💰 Cuenta de resultados", expanded=True):
+        render_financial_table(income_df, "Cuenta de resultados", period, data.currency, data.ticker)
+
+    with st.expander("🏦 Balance"):
+        render_financial_table(balance_df, "Balance", period, data.currency, data.ticker)
+
+    with st.expander("💵 Cash Flow"):
+        render_financial_table(cashflow_df, "Cash Flow", period, data.currency, data.ticker)
+
+    with st.expander("📈 Ratios y múltiplos", expanded=True):
+        render_ratios(data)
 
 
 if __name__ == "__main__":

@@ -166,10 +166,10 @@ def fetch_company_data(ticker: str) -> CompanyData:
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_price_history(ticker: str, period: str = "1y") -> pd.DataFrame:
+def fetch_price_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     """Descarga el histórico de precio de cierre para el gráfico de evolución."""
     try:
-        hist = yf.Ticker(ticker).history(period=period)
+        hist = yf.Ticker(ticker).history(period=period, interval=interval)
     except Exception as e:
         raise DataFetchError(f"Error al descargar histórico de precio de '{ticker}': {e}") from e
     return _safe_df(hist)
